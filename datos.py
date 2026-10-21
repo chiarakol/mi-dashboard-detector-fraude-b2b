@@ -276,9 +276,10 @@ def cargar_delta(cuenta: str, clave: str, entorno: str = "tesis", contenedor: st
                 if "deletionVectors" not in str(e):
                     raise
                 # Tablas con deletion vectors (Databricks): la ruta pyarrow no las lee, DataFusion sí
+                import pyarrow as pa
                 from deltalake import QueryBuilder
                 sel = ", ".join(f'"{c}"' for c in cols) if cols else "*"
-                tablas[t] = QueryBuilder().register("t", dt).execute(f"SELECT {sel} FROM t").read_all().to_pandas()
+                tablas[t] = pa.table(QueryBuilder().register("t", dt).execute(f"SELECT {sel} FROM t").read_all()).to_pandas()
         except Exception as e:  # tabla aún no creada o sin permiso
             tablas[t] = None
             faltan.append(t)
@@ -318,3 +319,4 @@ def cargar_csv(archivos) -> dict:
     semanal, recall_base = serie_semanal(tx)
     return dict(tx=tx, alertas=_alertas(al), semanal=semanal, recall_base=recall_base,
                 origen="CSV: " + ", ".join(usados), real=True)
+en="CSV: " + ", ".join(usados), real=True)
