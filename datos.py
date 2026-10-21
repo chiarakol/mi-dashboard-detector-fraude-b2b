@@ -8,7 +8,8 @@ Tres orígenes, todos terminan en el mismo formato:
 Todos devuelven un diccionario con cuatro DataFrames:
   tx        una fila por decisión (ya unida con la etiqueta real y la explicación)
   alertas   tabla alertas_drift
-  semanal   serie semanal de deriva (solo en la muestra; con datos reales queda vacía)
+  semanal   serie semanal de deriva (PSI y recall; en la muestra es fija, con datos reales se calcula en serie_semanal)
+  recall_base  recall de la línea base (para la línea de alerta)
   origen    texto que describe de dónde salieron los datos
 """
 from __future__ import annotations
@@ -53,6 +54,13 @@ _TIPO_FACT = {
     "cadena_fondos_paso": ["paso_rapido", "forma_parte_de_ciclo_2b", "cuenta_sospechosa"],
 }
 TABLAS_DELTA = ["decisiones_cads", "decisiones_evaluadas", "alertas_drift", "explicaciones_shap_lite"]
+# Columnas que realmente usa el panel: (nombres exactos, prefijos). alertas_drift es chica y se lee entera.
+_COLUMNAS_DELTA = {
+    "decisiones_cads": (["event_id", "timestamp_evento", "timestamp_decision", "decision", "brazo", "score_riesgo",
+                         "umbral_usado", "score_heuristica", "monto", "comprador_id", "proveedor_id", "modelo_version"], ()),
+    "decisiones_evaluadas": (["event_id", "es_fraude_real", "tipo_fraude_simulado"], ()),
+    "explicaciones_shap_lite": (["event_id", "shap_top", "shap_valor_base"], ("contrib_",)),
+}
 
 # Matriz de recompensa: la misma de capa3b_aprendizaje_bandit.py
 R_FRAUDE = {"bloquear": 1.0, "revision_manual": 0.5, "aprobar": -1.0}
@@ -105,23 +113,95 @@ def preparar(dec: pd.DataFrame, ev: pd.DataFrame | None = None, shap: pd.DataFra
         if "tipo_fraude_simulado" in e:
             tx["tipo"] = tx["event_id"].map(e["tipo_fraude_simulado"].replace("", np.nan))
     if shap is not None and len(shap):
-        cols = [c for c in shap.columns if c.startswith("contrib_")]
+        cols = [c for c in shap.columns if c.startswith("contrib_") or c in ("shap_top", "shap_valor_base")]
         s = shap.drop_duplicates("event_id", keep="last").set_index("event_id")[cols]
         tx = tx.join(s, on="event_id")
     tx["recompensa"] = [recompensa(d, f, m) for d, f, m in zip(tx["decision"], tx["fraude"], tx["monto"])]
     return tx.sort_values("ts").reset_index(drop=True)
 
 
+def parsear_shap_top(txt) -> list[tuple[str, float]]:
+    """'col:+0.1234;otra:-0.05' (columna shap_top de capa5) -> [('col', 0.1234), ('otra', -0.05)]."""
+    if txt is None or pd.isna(txt) or not str(txt).strip():
+        return []
+    out = []
+    for par in str(txt).split(";"):
+        nombre, _, valor = par.rpartition(":")
+        try:
+            out.append((nombre, float(valor)))
+        except ValueError:
+            continue
+    return out
+
+
 def _alertas(df: pd.DataFrame | None) -> pd.DataFrame:
+    """Alertas ordenadas de la más antigua a la más reciente (la última fila es la última alerta).
+    DTRO hace append en cada corrida: si repite la misma alerta para la misma ventana simulada, queda la última."""
     cols = ["tipo_alerta", "metrica", "valor_baseline", "valor_actual", "detalle"]
+    extra = ["ventana_hasta_sim", "timestamp_alerta"]
     if df is None or not len(df):
-        return pd.DataFrame(columns=cols)
+        return pd.DataFrame(columns=cols + extra)
+    df = df.copy()
     for c in cols:
         if c not in df:
             df[c] = np.nan
     for c in ("valor_baseline", "valor_actual"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df[[c for c in df.columns if c in cols or c == "fecha"]].reset_index(drop=True)
+    if "timestamp_alerta" in df:
+        df["timestamp_alerta"] = pd.to_datetime(df["timestamp_alerta"], errors="coerce", utc=True).dt.tz_localize(None)
+        df = df.sort_values("timestamp_alerta", kind="stable")
+    if "ventana_hasta_sim" in df:
+        df = df.drop_duplicates(["tipo_alerta", "metrica", "ventana_hasta_sim"], keep="last")
+    return df[cols + [c for c in extra if c in df]].reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------------------------------
+# Serie semanal de deriva, calculada aquí (DTRO solo guarda las alertas que superan el umbral)
+# ----------------------------------------------------------------------------------------------
+MIN_FILAS_VENTANA = 30   # igual que capa4_dtro.py
+MIN_FRAUDES_RECALL = 5   # por debajo, el recall semanal es ruido y no se grafica
+
+
+def _psi(base: np.ndarray, actual: np.ndarray, minimo: float = 1e-4) -> float:
+    b, a = np.maximum(base, minimo), np.maximum(actual, minimo)
+    return float(np.sum((a - b) * np.log(a / b)))
+
+
+def serie_semanal(tx: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    """PSI de score y de brazo, y recall, por ventanas de 7 días hacia atrás desde el último evento.
+    Línea base = todo lo anterior a los últimos 7 días (misma idea que capa4_dtro.py). Devuelve (serie, recall_base)."""
+    vacio = pd.DataFrame(columns=["semana", "psi_score", "psi_brazos", "recall"])
+    if tx.empty:
+        return vacio, np.nan
+    fin = tx["ts"].max()
+    base = tx[tx["ts"] < fin - pd.Timedelta(days=7)]
+    if len(base) < MIN_FILAS_VENTANA:
+        return vacio, np.nan
+    bins = np.linspace(0.0, 1.0, 11)
+
+    def prop_score(s):
+        return np.histogram(s.dropna(), bins=bins)[0] / max(len(s), 1)
+
+    def prop_brazo(s):
+        s = s.dropna().astype(int)
+        return np.array([(s == k).mean() if len(s) else 0.0 for k in range(3)])
+
+    def recall(g):
+        fr = g[g["fraude"].fillna(False).astype(bool)]
+        return float((fr["decision"] != "aprobar").mean()) if len(fr) >= MIN_FRAUDES_RECALL else np.nan
+
+    pb_s, pb_b = prop_score(base["score"]), prop_brazo(base["brazo"])
+    k = ((fin - tx["ts"]).dt.total_seconds() // (7 * 86400)).astype(int)
+    filas = []
+    for kk, g in tx.groupby(k):
+        if len(g) < MIN_FILAS_VENTANA:
+            continue
+        filas.append(dict(semana=fin - pd.Timedelta(days=7 * (int(kk) + 1)),
+                          psi_score=_psi(pb_s, prop_score(g["score"])),
+                          psi_brazos=_psi(pb_b, prop_brazo(g["brazo"])), recall=recall(g)))
+    if not filas:
+        return vacio, np.nan
+    return pd.DataFrame(filas).sort_values("semana").reset_index(drop=True), recall(base)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -172,7 +252,7 @@ def muestra(n: int = 1800, semilla: int = 2026) -> dict:
         dict(tipo_alerta="drift_distribucion", metrica="score_riesgo", valor_baseline=np.nan, valor_actual=.27, detalle="PSI=0.270 > umbral 0.25 (semana del 12/10)"),
         dict(tipo_alerta="drift_distribucion", metrica="brazo_bandit", valor_baseline=np.nan, valor_actual=.28, detalle="PSI=0.280 > umbral 0.25, el bandit cambió de umbral"),
         dict(tipo_alerta="drift_desempeno", metrica="recall_fraude", valor_baseline=.71, valor_actual=.52, detalle="El recall cayó 0.19 (límite 0.15)")])
-    return dict(tx=tx, alertas=alertas, semanal=semanal, origen="Datos de ejemplo (inventados)", real=False)
+    return dict(tx=tx, alertas=alertas, semanal=semanal, recall_base=0.71, origen="Datos de ejemplo (inventados)", real=False)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -185,7 +265,20 @@ def cargar_delta(cuenta: str, clave: str, entorno: str = "tesis", contenedor: st
     for t in TABLAS_DELTA:
         uri = f"abfss://{contenedor}@{cuenta}.dfs.core.windows.net/{entorno}/{t}"
         try:
-            tablas[t] = DeltaTable(uri, storage_options=opciones).to_pandas()
+            dt = DeltaTable(uri, storage_options=opciones)
+            cols = None
+            if t in _COLUMNAS_DELTA:  # evita traer los arrays pesados (contexto, x_modelo, shap_modelo)
+                quiero, prefijos = _COLUMNAS_DELTA[t]
+                cols = [f.name for f in dt.schema().fields if f.name in quiero or f.name.startswith(prefijos)]
+            try:
+                tablas[t] = dt.to_pandas(columns=cols)
+            except Exception as e:
+                if "deletionVectors" not in str(e):
+                    raise
+                # Tablas con deletion vectors (Databricks): la ruta pyarrow no las lee, DataFusion sí
+                from deltalake import QueryBuilder
+                sel = ", ".join(f'"{c}"' for c in cols) if cols else "*"
+                tablas[t] = QueryBuilder().register("t", dt).execute(f"SELECT {sel} FROM t").read_all().to_pandas()
         except Exception as e:  # tabla aún no creada o sin permiso
             tablas[t] = None
             faltan.append(t)
@@ -193,7 +286,8 @@ def cargar_delta(cuenta: str, clave: str, entorno: str = "tesis", contenedor: st
                 raise RuntimeError(f"No se pudo leer decisiones_cads en {uri}: {e}") from e
     tx = preparar(tablas["decisiones_cads"], tablas["decisiones_evaluadas"], tablas["explicaciones_shap_lite"])
     nota = f" (sin: {', '.join(faltan)})" if faltan else ""
-    return dict(tx=tx, alertas=_alertas(tablas["alertas_drift"]), semanal=pd.DataFrame(),
+    semanal, recall_base = serie_semanal(tx)
+    return dict(tx=tx, alertas=_alertas(tablas["alertas_drift"]), semanal=semanal, recall_base=recall_base,
                 origen=f"Azure · {cuenta} · entorno {entorno}{nota}", real=True)
 
 
@@ -220,5 +314,7 @@ def cargar_csv(archivos) -> dict:
         usados.append(f.name)
     if dec is None:
         raise ValueError("Falta decisiones_cads.csv (debe tener las columnas brazo y score_riesgo).")
-    return dict(tx=preparar(dec, ev, shap), alertas=_alertas(al), semanal=pd.DataFrame(),
+    tx = preparar(dec, ev, shap)
+    semanal, recall_base = serie_semanal(tx)
+    return dict(tx=tx, alertas=_alertas(al), semanal=semanal, recall_base=recall_base,
                 origen="CSV: " + ", ".join(usados), real=True)
