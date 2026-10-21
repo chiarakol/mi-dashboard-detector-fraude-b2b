@@ -319,4 +319,4 @@ def cargar_csv(archivos) -> dict:
     semanal, recall_base = serie_semanal(tx)
     return dict(tx=tx, alertas=_alertas(al), semanal=semanal, recall_base=recall_base,
                 origen="CSV: " + ", ".join(usados), real=True)
-en="CSV: " + ", ".join(usados), real=True)
+  
